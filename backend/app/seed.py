@@ -67,6 +67,23 @@ CREATE TABLE IF NOT EXISTS verify_reports (
   detail_json TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS split_proofs (
+  id INTEGER PRIMARY KEY,
+  settle_run_id INTEGER NOT NULL REFERENCES settle_runs(id),
+  parent_entry_key TEXT NOT NULL,
+  reversal_entry_id INTEGER NOT NULL REFERENCES ledger_entries(id),
+  account_id INTEGER NOT NULL REFERENCES accounts(id),
+  amount_cents INTEGER NOT NULL,
+  applied_cents INTEGER NOT NULL,
+  excess_cents INTEGER NOT NULL,
+  exposure_before_cents INTEGER NOT NULL,
+  split_kind TEXT NOT NULL,
+  quarantine_item_id INTEGER,
+  created_at TEXT NOT NULL,
+  CHECK (applied_cents >= 0 AND excess_cents >= 0),
+  CHECK (applied_cents + excess_cents = amount_cents),
+  UNIQUE (settle_run_id, parent_entry_key)
+);
 """
 
 # 旧库升级：缺列时补列（新增库由 CREATE TABLE 直接带上）
@@ -97,6 +114,18 @@ WHEN OLD.applied_cents IS NOT NULL
        OR NEW.excess_cents IS NOT OLD.excess_cents)
 BEGIN
   SELECT RAISE(ABORT, '冲正拆分分栏不可变');
+END;
+
+CREATE TRIGGER IF NOT EXISTS split_proofs_immutable_update
+BEFORE UPDATE ON split_proofs
+BEGIN
+  SELECT RAISE(ABORT, '拆笔证明不可变');
+END;
+
+CREATE TRIGGER IF NOT EXISTS split_proofs_immutable_delete
+BEFORE DELETE ON split_proofs
+BEGIN
+  SELECT RAISE(ABORT, '拆笔证明不可删除');
 END;
 """
 

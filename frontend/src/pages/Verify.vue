@@ -44,7 +44,7 @@ function yuan(cents) {
 <template>
   <div>
     <h1>净额互证</h1>
-    <p class="lead">核对「已归并流水净额（冲正只计已配平段）」与「账户余额合计」是否一致；超额隔离不计入净额，但独立对账。</p>
+    <p class="lead">核对「已归并流水净额（冲正只计已配平段）」与「账户余额合计」是否一致；超额隔离不计入净额，但独立对账。拆笔证明与分栏、隔离行三方同源核对。</p>
     <div class="row-actions">
       <button class="btn" :disabled="busy" @click="runVerify">跑净额互证</button>
     </div>
@@ -55,7 +55,7 @@ function yuan(cents) {
       <table>
         <thead>
           <tr>
-            <th>#</th><th>归并#</th><th>流水净额</th><th>余额合计</th><th>超额隔离</th><th>剩余敞口</th><th>隔离数</th><th>一致</th><th>时间</th>
+            <th>#</th><th>归并#</th><th>流水净额</th><th>余额合计</th><th>已配平冲正</th><th>超额隔离</th><th>证明超额</th><th>等式不平衡</th><th>剩余敞口</th><th>隔离数</th><th>一致</th><th>时间</th>
           </tr>
         </thead>
         <tbody>
@@ -64,7 +64,14 @@ function yuan(cents) {
             <td>{{ r.settle_run_id }}</td>
             <td>{{ yuan(r.ledger_net_cents) }}</td>
             <td>{{ yuan(r.balance_sum_cents) }}</td>
+            <td>{{ yuan(r.detail?.本轮已归并冲正额分) }}</td>
             <td>{{ yuan(r.detail?.本轮超额隔离额分) }}</td>
+            <td>{{ yuan(r.detail?.拆笔证明超额合计分) }}</td>
+            <td>
+              <span class="tag" :class="r.detail?.拆笔证明等式不平衡笔数 ? 'bad' : 'on'">
+                {{ r.detail?.拆笔证明等式不平衡笔数 ?? '—' }}
+              </span>
+            </td>
             <td>{{ yuan(r.detail?.剩余敞口分) }}</td>
             <td>{{ r.quarantine_count }}</td>
             <td>
@@ -74,7 +81,7 @@ function yuan(cents) {
             </td>
             <td>{{ r.created_at }}</td>
           </tr>
-          <tr v-if="!rows.length"><td colspan="9">尚无报告</td></tr>
+          <tr v-if="!rows.length"><td colspan="12">尚无报告</td></tr>
         </tbody>
       </table>
     </div>

@@ -15,10 +15,23 @@ STATUS_QUARANTINED = "已隔离"
 
 REASON_EXCESS = "冲正超额"
 
-# 新拆分落库的隔离行标记；用于与历史「整笔超额」隔离行区分
+# 冲正拆分类别；落隔离行与拆笔证明时同源使用
+SPLIT_KIND_FULL = "全额配平"
 SPLIT_KIND_PARTIAL = "部分配平"
 SPLIT_KIND_PURE_EXCESS = "整笔超额"
-SPLIT_KINDS = (SPLIT_KIND_PARTIAL, SPLIT_KIND_PURE_EXCESS)
+SPLIT_KIND_NO_TARGET = "无原单"
+SPLIT_KIND_ACCOUNT_MISMATCH = "账户不符"
+SPLIT_KIND_BLOCKED = "整笔隔离"
+SPLIT_KINDS = (
+    SPLIT_KIND_FULL,
+    SPLIT_KIND_PARTIAL,
+    SPLIT_KIND_PURE_EXCESS,
+    SPLIT_KIND_NO_TARGET,
+    SPLIT_KIND_ACCOUNT_MISMATCH,
+    SPLIT_KIND_BLOCKED,
+)
+# 走「按敞口切分」的类别；其余为未进入切分的整笔隔离
+EXPOSURE_SPLIT_KINDS = (SPLIT_KIND_FULL, SPLIT_KIND_PARTIAL, SPLIT_KIND_PURE_EXCESS)
 
 
 @dataclass(frozen=True)
@@ -43,6 +56,8 @@ class Split:
     def split_kind(self) -> str:
         if self.applied_cents > 0 and self.excess_cents > 0:
             return SPLIT_KIND_PARTIAL
+        if self.applied_cents > 0:
+            return SPLIT_KIND_FULL
         return SPLIT_KIND_PURE_EXCESS
 
 
@@ -52,6 +67,9 @@ def split_reversal(amount_cents: int, remaining_cents: int) -> Split:
     - 剩余敞口 <= 0：整笔进入隔离；
     - 冲正 <= 敞口：全额配平；
     - 冲正 > 敞口 > 0：敞口部分配平，超出部分隔离。
+
+    拆笔路径（择一，本仓取前者）：按**配平前敞口**一次性切分 applied/excess，
+    余额只认 applied；excess 必须同事务落隔离行并满足 applied + excess = 原冲正额。
     """
     if amount_cents < 0:
         raise ValueError("冲正金额不能为负")
@@ -61,9 +79,20 @@ def split_reversal(amount_cents: int, remaining_cents: int) -> Split:
     return Split(
         amount_cents=amount_cents,
         applied_cents=applied,
-        excess_cents=0,
+        excess_cents=amount_cents - applied,
     )
 
 
 def assert_split_invariant(split: Split, amount_cents: int) -> None:
-    return
+    """落库前守住拆笔等式：禁止「已扣全额只改隔离态」或静默截断。"""
+    if split.amount_cents != amount_cents:
+        raise ValueError("拆笔金额与原冲正额不一致")
+    if split.applied_cents < 0 or split.excess_cents < 0:
+        raise ValueError("拆笔分栏不能为负")
+    if split.applied_cents + split.excess_cents != amount_cents:
+        raise ValueError(
+            f"拆笔等式不成立：applied {split.applied_cents} + excess "
+            f"{split.excess_cents} != 原冲正额 {amount_cents}"
+        )
+    if split.applied_cents > 0 and split.excess_cents > 0 and split.status != STATUS_PARTIAL:
+        raise ValueError("部分配平状态与分栏不一致")

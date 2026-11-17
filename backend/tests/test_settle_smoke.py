@@ -205,3 +205,100 @@ def test_fail_closed_rollback(client, monkeypatch):
 
     report = client.post("/api/verify-reports").json()
     assert report["consistent"] == 1
+
+
+def test_split_invariant_rejects_silent_truncation():
+    """拆笔等式必须成立：禁止把 excess 静默截成 0。"""
+    from app.modules.excess_split import Split, assert_split_invariant
+
+    silent = Split(amount_cents=12000, applied_cents=8000, excess_cents=0)
+    with pytest.raises(ValueError):
+        assert_split_invariant(silent, 12000)
+
+    # 已按全额入账却把敞口损失记成 0：amount 与分栏对不上被拒
+    over_applied = Split(amount_cents=12000, applied_cents=12000, excess_cents=4000)
+    with pytest.raises(ValueError):
+        assert_split_invariant(over_applied, 12000)
+
+    ok = Split(amount_cents=12000, applied_cents=8000, excess_cents=4000)
+    assert_split_invariant(ok, 12000)
+
+
+def test_split_proof_endpoint(client):
+    """新增拆笔证明实体：按归并运行 id 只读查询，字段与分栏/隔离行同源。"""
+    runs = client.get("/api/settle-runs").json()
+    if not runs:
+        assert client.post("/api/settle-runs").status_code == 200
+        runs = client.get("/api/settle-runs").json()
+    # 模块内前面的用例可能又跑了一轮；取真正含该笔拆分证明的运行
+    run_id = None
+    for cand in runs:
+        proofs = client.get(f"/api/settle-runs/{cand['id']}/split-proofs").json()
+        if any(p["parent_entry_key"] == "REV-20261116-005" for p in proofs):
+            run_id = cand["id"]
+            break
+    assert run_id is not None
+    r = client.get(f"/api/settle-runs/{run_id}/split-proofs")
+    assert r.status_code == 200, r.text
+    proofs = {p["parent_entry_key"]: p for p in r.json()}
+
+    proof = proofs["REV-20261116-005"]
+    assert proof["settle_run_id"] == run_id
+    assert proof["amount_cents"] == 12000
+    assert proof["applied_cents"] == 8000
+    assert proof["excess_cents"] == 4000
+    assert proof["exposure_before_cents"] == 8000
+    assert proof["split_kind"] == "部分配平"
+    assert proof["balanced"] is True
+    assert proof["quarantine_item_id"] is not None
+    assert proof["quarantine_reason"] == "冲正超额"
+
+    # 同源：证明分栏 == 冲正分栏；证明超额 == 隔离行金额
+    revs = {e["entry_key"]: e for e in client.get("/api/entries?kind=冲正").json()}
+    rev = revs["REV-20261116-005"]
+    assert proof["applied_cents"] == rev["applied_cents"]
+    assert proof["excess_cents"] == rev["excess_cents"]
+    assert proof["amount_cents"] == rev["applied_cents"] + rev["excess_cents"]
+    q = {x["id"]: x for x in client.get("/api/quarantine").json()}
+    qrow = q[proof["quarantine_item_id"]]
+    assert qrow["amount_cents"] == proof["excess_cents"]
+    assert qrow["parent_entry_key"] == proof["parent_entry_key"]
+
+    # 整笔隔离（无原单）也落证明，excess = 全款、applied = 0
+    blocked = proofs["REV-20261116-004"]
+    assert (blocked["applied_cents"], blocked["excess_cents"]) == (0, 12000)
+    assert blocked["quarantine_item_id"] is not None
+
+
+def test_split_proof_endpoint_unknown_run(client):
+    assert client.get("/api/settle-runs/999999/split-proofs").status_code == 404
+
+
+def test_split_proofs_immutable(client):
+    """拆笔证明不可改不可删：审计凭证不能被报告文案替换。"""
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("UPDATE split_proofs SET excess_cents = 0 WHERE parent_entry_key = 'REV-20261116-005'")
+        conn.rollback()
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("DELETE FROM split_proofs WHERE parent_entry_key = 'REV-20261116-005'")
+        conn.rollback()
+    finally:
+        conn.close()
+
+
+def test_verify_report_carries_proof_source(client):
+    """互证报告字段直接取自分栏/隔离行/拆笔证明，不得只改文案。"""
+    report = client.post("/api/verify-reports").json()
+    detail = report["detail"]
+    assert report["consistent"] == 1
+    assert detail["拆笔证明配平台计分"] == detail["本轮已归并冲正额分"]
+    assert detail["拆笔证明超额合计分"] == detail["本轮超额隔离额分"]
+    assert detail["拆笔证明等式不平衡笔数"] == 0
+    latest_run_proofs = client.get(
+        "/api/settle-runs/" + str(report["settle_run_id"]) + "/split-proofs"
+    ).json()
+    assert detail["证明挂隔离行笔数"] == sum(1 for p in latest_run_proofs if p["excess_cents"] > 0)

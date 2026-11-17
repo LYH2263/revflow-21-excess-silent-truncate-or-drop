@@ -38,8 +38,18 @@ npm run dev
 - 超出敞口的部分作为「超额隔离」保留，可查可追溯；
 - 两者共享原冲正键：冲正行写不可变分栏 `applied_cents` / `excess_cents`，同时落 `quarantine_items` 行（`parent_entry_key` = 原冲正键，并记录 `split_applied_cents`、`exposure_cents`、`split_kind`）；
 - 冲正状态：全额配平 `已归并`、部分配平 `部分归并`、无可配平 `已隔离`；
-- 一轮归并是单事务（`BEGIN IMMEDIATE`）：分栏、余额、隔离行要么一起成功，要么全部回到操作前；落库后自校验失败即整轮回滚；
-- 归并报告与互证报告的「已归并冲正额 / 超额隔离额 / 剩余敞口」直接取自分栏、隔离表与流水派生余额，三方必须一致。
+- 一轮归并是单事务（`BEGIN IMMEDIATE`）：分栏、余额、隔离行、拆笔证明要么一起成功，要么全部回到操作前；落库后自校验失败即整轮回滚；
+- 归并报告与互证报告的「已归并冲正额 / 超额隔离额 / 剩余敞口」直接取自分栏、隔离表、拆笔证明与流水派生余额，四方必须一致。
+
+**拆笔路径（本仓择一）：** 按**配平前敞口**一次性切分 `applied` / `excess`；余额只认 `applied`，`excess` 必须同事务落隔离行，并满足 `applied + excess = 原冲正额`。禁止「已扣全额只改隔离态」。
+
+**拆笔证明实体 `split_proofs`**（基线所无）：每条证明挂归并运行 id，记录原冲正键 `parent_entry_key`、`applied_cents`、`excess_cents`、配平前敞口 `exposure_before_cents`、`amount_cents`、`split_kind` 与所挂隔离行 `quarantine_item_id`；表级 CHECK 守住 `applied + excess = amount`，触发器守不可改不可删。只读查询接口：
+
+```bash
+GET /api/settle-runs/{run_id}/split-proofs
+```
+
+冲正流水、未平隔离、归并台与净额互证界面均展示分栏 / 证明字段，且全部来自同一份分栏与证明实体（同源派生，不靠改文案）。
 
 
 ## 界面约定

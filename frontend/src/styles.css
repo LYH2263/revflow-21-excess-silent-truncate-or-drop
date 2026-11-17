@@ -402,7 +402,28 @@ tbody tr:hover { background: rgba(36, 87, 197, 0.04); }
 
 .msg { color: var(--danger); margin: 8px 0; }
 .ok { color: var(--ok); margin: 8px 0; }
-.row-actions { display: flex; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; }
+.row-actions { display: flex; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; align-items: center; }
+.input {
+  appearance: none;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--ink);
+  font: inherit;
+  font-family: var(--mono);
+  font-size: 13px;
+  padding: 10px 12px;
+  border-radius: 2px;
+  width: 160px;
+}
+.input:focus { outline: none; border-color: var(--accent); }
+.proof-meta {
+  display: block;
+  margin-top: 3px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--muted);
+  letter-spacing: 0.02em;
+}
 .note-strip {
   margin: 0 0 18px;
   padding: 12px 0 12px 12px;

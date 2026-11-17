@@ -14,6 +14,7 @@ from app.modules.excess_split import (
     assert_split_invariant,
     split_reversal,
 )
+from app.modules.split_proof import EXPOSURE_SPLIT_KINDS, SPLIT_KIND_BLOCKED
 from app.modules.fail_closed_settle import transaction
 
 
@@ -25,7 +26,11 @@ def _now() -> str:
 
 
 def _applied_expression() -> str:
-    return "amount_cents"
+    """余额与已配平口径只认分栏：配平段计入，超额段不计入。
+
+    旧库中尚未拆分的行分栏为 NULL，按整笔冲正处理（历史行为）。
+    """
+    return "COALESCE(applied_cents, amount_cents)"
 
 
 def _applied_by_target(conn) -> dict[str, int]:
@@ -112,8 +117,49 @@ def _insert_quarantine(
     return int(cur.lastrowid)
 
 
+def _insert_split_proof(
+    conn,
+    *,
+    settle_run_id: int,
+    parent_entry_key: str,
+    reversal_entry_id: int,
+    account_id: int,
+    amount_cents: int,
+    applied_cents: int,
+    excess_cents: int,
+    exposure_before_cents: int,
+    split_kind: str,
+    quarantine_item_id: int | None,
+    created_at: str,
+) -> int:
+    """落拆笔证明：与分栏、隔离行同事务写入，等式由表约束再守一遍。"""
+    cur = conn.execute(
+        """
+        INSERT INTO split_proofs(
+          settle_run_id, parent_entry_key, reversal_entry_id, account_id,
+          amount_cents, applied_cents, excess_cents, exposure_before_cents,
+          split_kind, quarantine_item_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            settle_run_id,
+            parent_entry_key,
+            reversal_entry_id,
+            account_id,
+            amount_cents,
+            applied_cents,
+            excess_cents,
+            exposure_before_cents,
+            split_kind,
+            quarantine_item_id,
+            created_at,
+        ),
+    )
+    return int(cur.lastrowid)
+
+
 def _check_run_totals(conn, run_id: int, applied_total: int, excess_total: int, remaining: int) -> None:
-    """落库前自校验：报告字段必须与分栏、隔离表、余额同源。"""
+    """落库前自校验：报告字段必须与分栏、隔离表、拆笔证明、余额同源。"""
     db_applied = conn.execute(
         f"""
         SELECT COALESCE(SUM({_applied_expression()}), 0) AS s FROM ledger_entries
@@ -135,6 +181,18 @@ def _check_run_totals(conn, run_id: int, applied_total: int, excess_total: int, 
         """,
         (run_id,),
     ).fetchone()["s"]
+    db_proof_applied = conn.execute(
+        "SELECT COALESCE(SUM(applied_cents), 0) AS s FROM split_proofs WHERE settle_run_id = ?",
+        (run_id,),
+    ).fetchone()["s"]
+    # 超额证明只统计进入敞口切分的类别；无原单/账户不符的整笔隔离另计隔离行
+    db_proof_excess = conn.execute(
+        f"""
+        SELECT COALESCE(SUM(excess_cents), 0) AS s FROM split_proofs
+        WHERE settle_run_id = ? AND split_kind IN ({",".join("?" for _ in EXPOSURE_SPLIT_KINDS)})
+        """,
+        (run_id, *EXPOSURE_SPLIT_KINDS),
+    ).fetchone()["s"]
     db_balance = conn.execute("SELECT COALESCE(SUM(balance_cents), 0) AS s FROM accounts").fetchone()["s"]
     expected_balance = sum(_recompute_balances(conn).values())
     # 剩余敞口独立重算：正向合计 − 全部已配平冲正合计
@@ -150,6 +208,66 @@ def _check_run_totals(conn, run_id: int, applied_total: int, excess_total: int, 
     ).fetchone()["s"]
     expected_remaining = db_fwd - db_rev_applied
 
+    # 逐笔证明：证明分栏必须与被证明冲正行的分栏一致，且挂得上隔离行。
+    # 未进入敞口切分的整笔隔离（无原单/账户不符）不写分栏，只校验金额与键。
+    proof_mismatch = conn.execute(
+        f"""
+        SELECT COUNT(*) AS c
+        FROM split_proofs p
+        JOIN ledger_entries e ON e.id = p.reversal_entry_id
+        WHERE p.settle_run_id = ?
+          AND (
+            e.entry_key <> p.parent_entry_key
+            OR p.applied_cents + p.excess_cents <> p.amount_cents
+            OR p.amount_cents <> e.amount_cents
+            OR (
+              p.split_kind IN ({",".join("?" for _ in EXPOSURE_SPLIT_KINDS)})
+              AND (
+                COALESCE(e.applied_cents, -1) <> p.applied_cents
+                OR COALESCE(e.excess_cents, -1) <> p.excess_cents
+              )
+            )
+          )
+        """,
+        (run_id, *EXPOSURE_SPLIT_KINDS),
+    ).fetchone()["c"]
+    proof_without_quarantine = conn.execute(
+        """
+        SELECT COUNT(*) AS c FROM split_proofs p
+        WHERE p.settle_run_id = ?
+          AND p.excess_cents > 0
+          AND p.quarantine_item_id IS NULL
+        """,
+        (run_id,),
+    ).fetchone()["c"]
+    proof_quarantine_mismatch = conn.execute(
+        """
+        SELECT COUNT(*) AS c
+        FROM split_proofs p
+        JOIN quarantine_items q ON q.id = p.quarantine_item_id
+        WHERE p.settle_run_id = ?
+          AND (
+            q.parent_entry_key <> p.parent_entry_key
+            OR q.settle_run_id <> p.settle_run_id
+            OR q.amount_cents <> p.excess_cents
+            OR q.split_applied_cents <> p.applied_cents
+            OR q.exposure_cents <> p.exposure_before_cents
+          )
+        """,
+        (run_id,),
+    ).fetchone()["c"]
+    reversal_without_proof = conn.execute(
+        """
+        SELECT COUNT(*) AS c
+        FROM ledger_entries e
+        WHERE e.kind = '冲正' AND e.settle_run_id = ?
+          AND NOT EXISTS (
+            SELECT 1 FROM split_proofs p WHERE p.reversal_entry_id = e.id
+          )
+        """,
+        (run_id,),
+    ).fetchone()["c"]
+
     problems = []
     if db_applied != applied_total:
         problems.append(f"已归并冲正额 {applied_total} != 分栏合计 {db_applied}")
@@ -157,6 +275,18 @@ def _check_run_totals(conn, run_id: int, applied_total: int, excess_total: int, 
         problems.append(f"超额隔离额 {excess_total} != 隔离表合计 {db_excess}")
     if db_excess_columns != excess_total:
         problems.append(f"超额隔离额 {excess_total} != 冲正超额分栏合计 {db_excess_columns}")
+    if db_proof_applied != applied_total:
+        problems.append(f"已归并冲正额 {applied_total} != 拆笔证明配平台计 {db_proof_applied}")
+    if db_proof_excess != excess_total:
+        problems.append(f"超额隔离额 {excess_total} != 拆笔证明超限合计 {db_proof_excess}")
+    if proof_mismatch:
+        problems.append(f"{proof_mismatch} 条拆笔证明与冲正分栏不一致")
+    if proof_without_quarantine:
+        problems.append(f"{proof_without_quarantine} 条超额拆笔证明未落隔离行")
+    if proof_quarantine_mismatch:
+        problems.append(f"{proof_quarantine_mismatch} 条拆笔证明与隔离行不一致")
+    if reversal_without_proof:
+        problems.append(f"{reversal_without_proof} 笔本轮冲正无拆笔证明")
     if _remaining_exposure_cents(conn) != remaining:
         problems.append("剩余敞口与流水敞口不一致")
     if remaining != expected_remaining:
@@ -249,6 +379,36 @@ def list_settle_runs() -> list[dict]:
         )
 
 
+def list_split_proofs(settle_run_id: int) -> list[dict]:
+    """按归并运行 id 只读查询拆笔证明。
+
+    证明字段（原冲正键 / applied / excess / 配平前敞口）与冲正分栏、隔离行同源，
+    供界面与审计核对 applied + excess = 原冲正额。
+    """
+    with connect() as conn:
+        run = conn.execute("SELECT id FROM settle_runs WHERE id = ?", (settle_run_id,)).fetchone()
+        if not run:
+            raise HTTPException(404, "归并运行不存在")
+        rows = conn.execute(
+            """
+            SELECT p.*,
+                   a.code AS account_code,
+                   q.reason AS quarantine_reason,
+                   q.split_kind AS quarantine_split_kind
+            FROM split_proofs p
+            JOIN accounts a ON a.id = p.account_id
+            LEFT JOIN quarantine_items q ON q.id = p.quarantine_item_id
+            WHERE p.settle_run_id = ?
+            ORDER BY p.id
+            """,
+            (settle_run_id,),
+        ).fetchall()
+        out = rows_to_dicts(rows)
+    for r in out:
+        r["balanced"] = r["applied_cents"] + r["excess_cents"] == r["amount_cents"]
+    return out
+
+
 def list_verify_reports() -> list[dict]:
     with connect() as conn:
         rows = rows_to_dicts(
@@ -307,7 +467,7 @@ def _run_settle_in_transaction(conn) -> int:
     for r in reversals:
         target = r.get("target_entry_key")
         if not target or target not in all_forwards:
-            _insert_quarantine(
+            qid = _insert_quarantine(
                 conn,
                 entry_key=r["entry_key"],
                 account_id=r["account_id"],
@@ -318,18 +478,33 @@ def _run_settle_in_transaction(conn) -> int:
                 parent_entry_key=r["entry_key"],
                 split_applied_cents=0,
                 exposure_cents=0,
-                split_kind="整笔隔离",
+                split_kind=SPLIT_KIND_BLOCKED,
             )
+            # 未进入敞口切分的整笔隔离不写分栏：分栏专指「配平前缀 / 超额」拆分结果
             conn.execute(
                 "UPDATE ledger_entries SET status = ?, settle_run_id = ? WHERE id = ?",
                 (STATUS_QUARANTINED, run_id, r["id"]),
+            )
+            _insert_split_proof(
+                conn,
+                settle_run_id=run_id,
+                parent_entry_key=r["entry_key"],
+                reversal_entry_id=r["id"],
+                account_id=r["account_id"],
+                amount_cents=r["amount_cents"],
+                applied_cents=0,
+                excess_cents=r["amount_cents"],
+                exposure_before_cents=0,
+                split_kind=SPLIT_KIND_BLOCKED,
+                quarantine_item_id=qid,
+                created_at=now,
             )
             quarantined += 1
             continue
 
         fwd = all_forwards[target]
         if fwd["account_id"] != r["account_id"]:
-            _insert_quarantine(
+            qid = _insert_quarantine(
                 conn,
                 entry_key=r["entry_key"],
                 account_id=r["account_id"],
@@ -340,28 +515,58 @@ def _run_settle_in_transaction(conn) -> int:
                 parent_entry_key=r["entry_key"],
                 split_applied_cents=0,
                 exposure_cents=0,
-                split_kind="整笔隔离",
+                split_kind=SPLIT_KIND_BLOCKED,
             )
+            # 未进入敞口切分的整笔隔离不写分栏：分栏专指「配平前缀 / 超额」拆分结果
             conn.execute(
                 "UPDATE ledger_entries SET status = ?, settle_run_id = ? WHERE id = ?",
                 (STATUS_QUARANTINED, run_id, r["id"]),
             )
+            _insert_split_proof(
+                conn,
+                settle_run_id=run_id,
+                parent_entry_key=r["entry_key"],
+                reversal_entry_id=r["id"],
+                account_id=r["account_id"],
+                amount_cents=r["amount_cents"],
+                applied_cents=0,
+                excess_cents=r["amount_cents"],
+                exposure_before_cents=0,
+                split_kind=SPLIT_KIND_BLOCKED,
+                quarantine_item_id=qid,
+                created_at=now,
+            )
             quarantined += 1
             continue
 
+        # 拆笔路径：按配平前敞口一次切分 applied/excess，余额只认 applied
         remaining = max(0, fwd["amount_cents"] - applied_by_target.get(target, 0))
         split = split_reversal(r["amount_cents"], remaining)
         assert_split_invariant(split, r["amount_cents"])
-
-        if False and split.excess_cents > 0:
-            quarantined += 1
 
         if split.applied_cents > 0:
             applied_by_target[target] = applied_by_target.get(target, 0) + split.applied_cents
             settled += 1
             applied_total += split.applied_cents
+
+        qid = None
         if split.excess_cents > 0:
+            # 超额段必须同事务落未平隔离，且与冲正行共享原冲正键
+            qid = _insert_quarantine(
+                conn,
+                entry_key=r["entry_key"],
+                account_id=r["account_id"],
+                reason=REASON_EXCESS,
+                amount_cents=split.excess_cents,
+                settle_run_id=run_id,
+                created_at=now,
+                parent_entry_key=r["entry_key"],
+                split_applied_cents=split.applied_cents,
+                exposure_cents=remaining,
+                split_kind=split.split_kind,
+            )
             excess_total += split.excess_cents
+            quarantined += 1
 
         conn.execute(
             """
@@ -370,6 +575,20 @@ def _run_settle_in_transaction(conn) -> int:
             WHERE id = ?
             """,
             (split.status, split.applied_cents, split.excess_cents, run_id, r["id"]),
+        )
+        _insert_split_proof(
+            conn,
+            settle_run_id=run_id,
+            parent_entry_key=r["entry_key"],
+            reversal_entry_id=r["id"],
+            account_id=r["account_id"],
+            amount_cents=split.amount_cents,
+            applied_cents=split.applied_cents,
+            excess_cents=split.excess_cents,
+            exposure_before_cents=remaining,
+            split_kind=split.split_kind,
+            quarantine_item_id=qid,
+            created_at=now,
         )
 
     for f in forwards:
@@ -527,11 +746,64 @@ def run_verify(settle_run_id: int | None = None) -> dict:
             (settle_run_id,),
         ).fetchone()["c"]
 
+        # 拆笔证明互证：证明是「分栏 + 隔离行 + 配平前敞口」的同源凭证
+        proof_applied = conn.execute(
+            "SELECT COALESCE(SUM(applied_cents), 0) AS s FROM split_proofs WHERE settle_run_id = ?",
+            (settle_run_id,),
+        ).fetchone()["s"]
+        proof_excess = conn.execute(
+            f"""
+            SELECT COALESCE(SUM(excess_cents), 0) AS s FROM split_proofs
+            WHERE settle_run_id = ? AND split_kind IN ({",".join("?" for _ in EXPOSURE_SPLIT_KINDS)})
+            """,
+            (settle_run_id, *EXPOSURE_SPLIT_KINDS),
+        ).fetchone()["s"]
+        proof_rows = conn.execute(
+            "SELECT COUNT(*) AS c FROM split_proofs WHERE settle_run_id = ?",
+            (settle_run_id,),
+        ).fetchone()["c"]
+        proof_unbalanced = conn.execute(
+            """
+            SELECT COUNT(*) AS c FROM split_proofs
+            WHERE settle_run_id = ? AND applied_cents + excess_cents <> amount_cents
+            """,
+            (settle_run_id,),
+        ).fetchone()["c"]
+        exposure_split_proofs = conn.execute(
+            f"""
+            SELECT COUNT(*) AS c FROM split_proofs
+            WHERE settle_run_id = ? AND split_kind IN ({",".join("?" for _ in EXPOSURE_SPLIT_KINDS)})
+            """,
+            (settle_run_id, *EXPOSURE_SPLIT_KINDS),
+        ).fetchone()["c"]
+        proof_quarantine_linked = conn.execute(
+            """
+            SELECT COUNT(*) AS c
+            FROM split_proofs p
+            JOIN quarantine_items q ON q.id = p.quarantine_item_id
+            WHERE p.settle_run_id = ?
+              AND q.parent_entry_key = p.parent_entry_key
+              AND q.amount_cents = p.excess_cents
+            """,
+            (settle_run_id,),
+        ).fetchone()["c"]
+        proof_excess_rows = conn.execute(
+            """
+            SELECT COUNT(*) AS c FROM split_proofs
+            WHERE settle_run_id = ? AND excess_cents > 0
+            """,
+            (settle_run_id,),
+        ).fetchone()["c"]
+
         consistent = (
             1
             if all_ledger_net == all_bal
             and excess_quarantine == excess_columns
             and traced == excess_rows == split_columns
+            and proof_applied == applied_reversal
+            and proof_excess == excess_quarantine
+            and proof_unbalanced == 0
+            and proof_quarantine_linked == proof_excess_rows
             else 0
         )
         detail = {
@@ -549,6 +821,12 @@ def run_verify(settle_run_id: int | None = None) -> dict:
             "超额分栏笔数": split_columns,
             "可溯源超额行数": traced,
             "剩余敞口分": remaining_exposure,
+            "拆笔证明笔数": proof_rows,
+            "拆笔证明配平台计分": proof_applied,
+            "拆笔证明超额合计分": proof_excess,
+            "拆笔证明等式不平衡笔数": proof_unbalanced,
+            "敞口切分证明笔数": exposure_split_proofs,
+            "证明挂隔离行笔数": proof_quarantine_linked,
         }
         now = _now()
         cur = conn.execute(
